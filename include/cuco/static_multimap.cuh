@@ -1,0 +1,206 @@
+/*
+ * Copyright (c) 2020, NVIDIA CORPORATION.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+#include <cuda/std/atomic>
+
+namespace cuco {
+
+// TODO: replace with custom pair type
+template <typename K, V>
+using pair_type = thrust::pair<K, V>;
+
+// TODO: Allocator
+template <typename Key, typename Value, cuda::thread_scope Scope = cuda::thread_scope_device>
+class static_multimap {
+  static_assert(std::is_arithmetic<Key>::value, "Unsupported, non-arithmetic key type.");
+
+ public:
+  using value_type         = cuco::pair_type<Key, Value>;
+  using key_type           = Key;
+  using mapped_type        = Value;
+  using atomic_key_type    = cuda::atomic<key_type, Scope>;
+  using atomic_mapped_type = cuda::atomic<mapped_type, Scope>;
+  using pair_atomic_type   = cuco::pair_type<atomic_key_type, atomic_mapped_type>;
+
+  static_multimap(static_multimap const&) = delete;
+  static_multimap(static_multimap&&)      = delete;
+  static_multimap& operator=(static_multimap const&) = delete;
+  static_multimap& operator=(static_multimap&&) = delete;
+
+  /**
+   * @brief Construct a fixed-size map with the specified capacity and sentinel values.
+   *
+   * details here...
+   *
+   * @param capacity The total number of slots in the map
+   * @param empty_key_sentinel The reserved key value for empty slots
+   * @param empty_value_sentinel The reserved mapped value for empty slots
+   */
+  static_multimap(std::size_t capacity, Key empty_key_sentinel, Value empty_value_sentinel);
+
+  ~static_multimap();
+
+  template <typename InputIt, typename Hash, typename KeyEqual>
+  void insert(InputIt first, InputIt last, Hash hash, KeyEqual key_equal);
+
+  /**
+   * @brief Finds all elements matching the probe keys
+   *
+   * Returns all key,value pairs whose key matches one of the probe keys
+   *
+   * TODO: This is an extension of `find_if_exists` from the map to multimap.
+   *
+   * @tparam InputIt
+   * @tparam OutputIt
+   * @tparam Hash
+   * @tparam KeyEqual
+   * @param first
+   * @param last
+   * @param output_begin
+   * @param hash
+   * @param key_equal
+   */
+  template <typename InputIt, typename OutputIt, typename Hash, typename KeyEqual>
+  void find_all(InputIt probe_first,
+                InputIt probe_last,
+                OutputIt output_begin,
+                OUtputIt output_end,
+                Hash hash,
+                KeyEqual key_equal) noexcept;
+
+  /**
+   * @brief Counts the number of elements matching the probe keys
+   *
+   * @tparam InputIt
+   * @tparam OutputIt
+   * @tparam Hash
+   * @tparam KeyEqual
+   * @param first
+   * @param last
+   * @param output_begin
+   * @param hash
+   * @param key_equal
+   */
+  template <typename InputIt, typename OutputIt, typename Hash, typename KeyEqual>
+  void count_all(
+    InputIt first, InputIt last, OutputIt output_begin, Hash hash, KeyEqual key_equal) noexcept;
+
+  /**
+   * @brief Checks if each probe key is present in the multimap
+   *
+   * @tparam InputIt
+   * @tparam OutputIt
+   * @tparam Hash
+   * @tparam KeyEqual
+   * @param first
+   * @param last
+   * @param output_begin
+   * @param hash
+   * @param key_equal
+   */
+  template <typename InputIt, typename OutputIt, typename Hash, typename KeyEqual>
+  void contains(
+    InputIt first, InputIt last, OutputIt output_begin, Hash hash, KeyEqual key_equal) noexcept;
+
+  class device_mutable_view {
+   public:
+    using iterator       = pair_atomic_type*;
+    using const_iterator = pair_atomic_type const*;
+
+    device_mutable_view(pair_atomic_type* slots,
+                        std::size_t capacity,
+                        Key empty_key_sentinel,
+                        Value empty_value_sentinel) noexcept;
+
+    template <typename Hash, typename KeyEqual>
+    __device__ cuco::pair<iterator, bool> insert(value_type const& insert_pair,
+                                                 KeyEqual key_equal,
+                                                 Hash hash) noexcept;
+
+    template <typename CG, typename Hash, typename KeyEqual>
+    __device__ cuco::pair<iterator, bool> insert(CG cg,
+                                                 value_type const& insert_pair,
+                                                 KeyEqual key_equal,
+                                                 Hash hash) noexcept;
+
+    std::size_t capacity();
+
+    Key get_empty_key_sentinel() const noexcept { return empty_key_sentinel_; }
+
+    Value get_empty_value_sentinel() const noexcept { return empty_value_sentinel_; }
+
+   private:
+    pair_atomic_type* __restrict__ slots_{};
+    std::size_t const capacity_{};
+    Key const empty_key_sentinel_{};
+    Value const empty_value_sentinel_{};
+  };
+
+  class device_view {
+   public:
+    using iterator       = pair_atomic_type*;
+    using const_iterator = pair_atomic_type const*;
+
+    device_view(pair_atomic_type* slots,
+                std::size_t capacity,
+                Key empty_key_sentinel,
+                Value empty_value_sentinel) noexcept;
+
+    template <typename Hash, typename KeyEqual>
+    __device__ iterator find(Key const& k, KeyEqual key_equal, Hash hash) noexcept;
+
+    template <typename CG, typename Hash, typename KeyEqual>
+    __device__ iterator find(CG cg, Key const& k, KeyEqual key_equal, Hash hash) noexcept;
+
+    template <typename Hash, typename KeyEqual>
+    __device__ bool contains(Key const& k, KeyEqual key_equal, Hash hash) noexcept;
+
+    template <typename CG, typename Hash, typename KeyEqual>
+    __device__ bool contains(CG cg, Key const& k, KeyEqual key_equal, Hash hash) noexcept;
+
+    std::size_t capacity();
+
+    Key get_empty_key_sentinel() const noexcept { return empty_key_sentinel_; }
+
+    Value get_empty_value_sentinel() const noexcept { return empty_value_sentinel_; }
+
+   private:
+    pair_atomic_type* __restrict__ slots_{};
+    std::size_t const capacity_{};
+    Key const empty_key_sentinel_{};
+    Value const empty_value_sentinel_{};
+  };
+
+  Key get_empty_key_sentinel() const noexcept { return empty_key_sentinel_; }
+
+  Value get_empty_value_sentinel() const noexcept { return empty_value_sentinel_; }
+
+  device_view get_device_view();
+
+  device_mutable_view get_device_mutable_view();
+
+  std::size_t capacity();
+
+ private:
+  pair_atomic_type* slots_{nullptr};    ///< Pointer to flat slots storage
+  std::size_t capacity_{};              ///< Total number of slots
+  Key const empty_key_sentinel_{};      ///< Key value that represents an empty slot
+  Value const empty_value_sentinel_{};  ///< Initial value of empty slot
+};
+
+}  // namespace cuco
