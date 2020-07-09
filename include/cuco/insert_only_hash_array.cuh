@@ -227,43 +227,48 @@ class insert_only_hash_array {
 
       while (true) {
         using cuda::std::memory_order_relaxed;
-        auto expected_key   = empty_key_sentinel_;
-        auto expected_value = empty_value_sentinel_;
 
         auto& slot_key   = current_slot->first;
         auto& slot_value = current_slot->second;
 
-        // Update key/value via independent CASes
-        bool key_success =
-          slot_key.compare_exchange_strong(expected_key, insert_pair.first, memory_order_relaxed);
+        // Load key w/o CAS to first check for empty.
+        auto current_key = slot_key.load(memory_order_relaxed);
 
-        bool value_success = slot_value.compare_exchange_strong(
-          expected_value, insert_pair.second, memory_order_relaxed);
+        // Only perform CAS if key is actually empty
+        if (current_key == empty_key_sentinel_) {
+          auto expected_key   = empty_key_sentinel_;
+          auto expected_value = empty_value_sentinel_;
+          // Update key/value via independent CASes
+          bool key_success =
+            slot_key.compare_exchange_strong(expected_key, insert_pair.first, memory_order_relaxed);
 
-        // Usually, both will succeed. Otherwise, whoever won the key CAS is
-        // guaranteed to eventually update the value
-        if (key_success) {
-          // If key succeeds and value doesn't, someone else won the value CAS
-          // Spin trying to update the value
-          while (not value_success) {
-            value_success = slot_value.compare_exchange_strong(
-              expected_value = empty_value_sentinel_, insert_pair.second, memory_order_relaxed);
+          bool value_success = slot_value.compare_exchange_strong(
+            expected_value, insert_pair.second, memory_order_relaxed);
+
+          // Usually, both will succeed. Otherwise, whoever won the key CAS is
+          // guaranteed to eventually update the value
+          if (key_success) {
+            // If key succeeds and value doesn't, someone else won the value CAS
+            // Spin trying to update the value
+            while (not value_success) {
+              value_success = slot_value.compare_exchange_strong(
+                expected_value = empty_value_sentinel_, insert_pair.second, memory_order_relaxed);
+            }
+            return thrust::make_pair(current_slot, true);
+          } else if (value_success) {
+            // Key CAS failed, but value succeeded. Restore the value to it's
+            // initial value
+
+            // TODO: The pair<atomic<K>, atomic<V>> implementation precludes concurrent insert/find
+            // because another thread doing a "find" for the key that's being inserted could observe
+            // that the key is updated before the value is updated.
+            slot_value.store(empty_value_sentinel_, memory_order_relaxed);
           }
-          return thrust::make_pair(current_slot, true);
-        } else if (value_success) {
-          // Key CAS failed, but value succeeded. Restore the value to it's
-          // initial value
-
-          // TODO: The pair<atomic<K>, atomic<V>> implementation precludes concurrent insert/find
-          // because another thread doing a "find" for the key that's being inserted could observe
-          // that the key is updated before the value is updated.
-          slot_value.store(empty_value_sentinel_, memory_order_relaxed);
+          current_key = expected_key;
         }
 
-        // expected_key/expected_value contain actual values
-
         // Key already exists
-        if (key_equal(insert_pair.first, expected_key)) {
+        if (key_equal(insert_pair.first, current_key)) {
           return thrust::make_pair(current_slot, false);
         }
 
