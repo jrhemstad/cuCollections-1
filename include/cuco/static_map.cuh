@@ -35,8 +35,71 @@
 namespace cuco {
 
   
-
-template <typename Key, typename Value, cuda::thread_scope Scope = cuda::thread_scope_device>
+/**
+ * @brief A GPU-accelerated, unordered, associative container of key-value
+ * pairs with unique keys.
+ *
+ * Allows constant time concurrent inserts or concurrent find operations (not
+ * concurrent insert and find) from threads in device code.
+ *
+ * Current limitations:
+ * - Requires keys that are Arithmetic
+ * - Does not support erasing keys
+ * - Capacity is fixed and will not grow automatically
+ * - Requires the user to specify sentinel values for both key and mapped value
+ * to indicate empty slots
+ * - Does not support concurrent insert and find operations
+ *
+ * The `static_map` supports two types of operations:
+ * - Host-side "bulk" operations
+ * - Device-side "singular" operations
+ *
+ * The host-side bulk operations include `insert`, `find`, and `contains`. These
+ * APIs should be used when there are a large number of keys to insert or lookup
+ * in the map. For example, given a range of keys specified by device-accessible
+ * iterators, the bulk `insert` function will insert all keys into the map.
+ *
+ * The singular device-side operations allow individual threads to to perform
+ * independent insert or find/contains operations from device code. These
+ * operations are accessed through non-owning, trivially copyable "view" types:
+ * `device_view` and `mutable_device_view`. The `device_view` class is an
+ * immutable view that allows only non-modifying operations such as `find` or
+ * `contains`. The `mutable_device_view` class only allows `insert` operations.
+ * The two types are separate to prevent erroneous concurrent insert/find
+ * operations.
+ *
+ * Example:
+ * \code{.cpp}
+ * int empty_key_sentinel = -1;
+ * int empty_value_sentine = -1;
+ *
+ * // Constructs a map with 100,000 slots using -1 and -1 as the empty key/value
+ * // sentinels. Note the capacity is chosen knowing we will insert 50,000 keys,
+ * // for an load factor of 50%.
+ * static_map<int, int> m{100'000, empty_key_sentinel, empty_value_sentinel};
+ *
+ * // Create a sequence of pairs {{0,0}, {1,1}, ... {i,i}}
+ * thrust::device_vector<thrust::pair<int,int>> pairs(50,000);
+ * thrust::transform(thrust::make_counting_iterator(0),
+ *                   thrust::make_counting_iterator(pairs.size()),
+ *                   pairs.begin(),
+ *                   []__device__(auto i){ return thrust::make_pair(i,i); };
+ *
+ *
+ * // Inserts all pairs into the map
+ * m.insert(pairs.begin(), pairs.end());
+ *
+ * // Get a `device_view` and passes it to a kernel where threads may perform
+ * // `find/contains` lookups
+ * kernel<<<...>>>(m.get_device_view());
+ * \endcode
+ *
+ *
+ * @tparam Key Arithmetic type used for key
+ * @tparam Value Type of the mapped values
+ * @tparam Scope The scope in which insert/find operations will be performed by
+ * individual threads.
+ */
 class static_map {
   static_assert(std::is_arithmetic<Key>::value, "Unsupported, non-arithmetic key type.");
 
@@ -55,9 +118,21 @@ class static_map {
   static_map& operator=(static_map&&) = delete;
 
   /**
-   * @brief Construct a fixed-size map with the specified capacity and sentinel values.
+   * @brief Construct a statically sized map with the specified number of slots
+   * and sentinel values.
    *
-   * details here...
+   * The capacity of the map is fixed. Insert operations will not automatically
+   * grow the map. Attempting to insert more unique keys than the capacity of
+   * the map results in undefined behavior.
+   *
+   * Performance begins to degrade significantly beyond a load factor of ~70%.
+   * For best performance, choose a capacity that will keep the load factor
+   * below 70%. E.g., if inserting `N` unique keys, choose a capacity of
+   * `N * (1/0.7)`.
+   *
+   * The `empty_key_sentinel` and `empty_value_sentinel` values are reserved and
+   * undefined behavior results from attempting to insert any key/value pair
+   * that contains either.
    *
    * @param capacity The total number of slots in the map
    * @param empty_key_sentinel The reserved key value for empty slots
@@ -65,10 +140,27 @@ class static_map {
    */
   static_map(std::size_t capacity, Key empty_key_sentinel, Value empty_value_sentinel);
 
+  /**
+   * @brief Destroys the map and frees its contents.
+   *
+   */
   ~static_map();
 
-  template <typename InputIt,
-            typename Hash = MurmurHash3_32<key_type>,
+  /**
+   * @brief Inserts all key/value pairs in the range `[first, last)`.
+   *
+   * If multiple keys in `[first, last)` compare equal, it is unspecified which
+   * element is inserted.
+   *
+   * @tparam InputIt Device accessible input iterator whose `value_type` is
+   * convertible to the maps `value_type`
+   * @tparam Hash Unary callable type
+   * @tparam KeyEqual Binary callable type
+   * @param first Beginning of the sequence of key/value pairs
+   * @param last End of the sequence of key/value pairs
+   * @param hash The unary function to apply to hash each key
+   * @param key_equal The binary function to compare two keys for equality
+   */
             typename KeyEqual = thrust::equal_to<key_type>>
   void insert(InputIt first, InputIt last, 
               Hash hash = Hash{},
@@ -90,13 +182,30 @@ class static_map {
     Hash hash = Hash{}, 
     KeyEqual key_equal = KeyEqual{}) noexcept;
 
+  /**
+   * @brief Mutable, non-owning view-type that may be used in device code to
+   * perform singular inserts into the map.
+   *
+   * `device_mutable_view` is trivially-copyable and is intended to be passed by
+   * value.
+   *
+   */
   class device_mutable_view {
   public:
     using iterator       = pair_atomic_type*;
     using const_iterator = pair_atomic_type const*;
     
-    device_mutable_view(pair_atomic_type* slots,
-                        std::size_t capacity,
+    /**
+     * @brief Construct a mutable view of the first `capacity` slots of the
+     * slots array pointed to by `slots`.
+     *
+     * @param slots Pointer to beginning of initialized slots array
+     * @param capacity The number of slots viewed by this object
+     * @param empty_key_sentinel The reserved value for keys to represent empty
+     * slots
+     * @param empty_value_sentinel The reserved value for mapped values to
+     * represent empty slots
+     */
                         Key empty_key_sentinel,
                         Value empty_value_sentinel) noexcept :
       slots_{slots},
@@ -104,6 +213,22 @@ class static_map {
       empty_key_sentinel_{empty_key_sentinel},
       empty_value_sentinel_{empty_value_sentinel} {}
 
+    /**
+     * @brief Inserts the specified key/value pair into the map.
+     *
+     * Returns a pair consisting of an iterator to the inserted element (or to
+     * the element that prevented the insertion) and a `bool` denoting whether
+     * the insertion took place.
+     *
+     * @tparam Hash Unary callable type
+     * @tparam KeyEqual Binary callable type
+     * @param insert_pair The pair to insert
+     * @param hash The unary callable used to hash the key
+     * @param key_equal The binary callable used to compare two keys for
+     * equality
+     * @return A pair containing an iterator and bool pair to the inserted
+     * element (or existing element) and whether the insert took place
+     */
     template <typename Iterator = iterator,
               typename Hash = MurmurHash3_32<key_type>,
               typename KeyEqual = thrust::equal_to<key_type>>
