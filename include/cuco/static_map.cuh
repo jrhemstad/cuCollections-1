@@ -189,6 +189,19 @@ class static_map {
    * `device_mutable_view` is trivially-copyable and is intended to be passed by
    * value.
    *
+   * Example:
+   * \code{.cpp}
+   * cuco::static_map<int,int> m{100'000, -1, -1};
+   *
+   * // Inserts a sequence of pairs {{0,0}, {1,1}, ... {i,i}}
+   * thrust::for_each(thrust::make_counting_iterator(0),
+   *                  thrust::make_counting_iterator(50'000),
+   *                  [map = m.get_mutable_device_view()]
+   *                  __device__ (auto i) mutable {
+   *                     map.insert(thrust::make_pair(i,i));
+   *                  });
+   * \endcode
+   *
    */
   class device_mutable_view {
   public:
