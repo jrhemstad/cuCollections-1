@@ -127,7 +127,6 @@ class static_map {
    * grow the map. Attempting to insert more unique keys than the capacity of
    * the map results in undefined behavior.
    *
-   * details here...
    * Performance begins to degrade significantly beyond a load factor of ~70%.
    * For best performance, choose a capacity that will keep the load factor
    * below 70%. E.g., if inserting `N` unique keys, choose a capacity of
