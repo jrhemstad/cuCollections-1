@@ -116,6 +116,89 @@ private:
     bool b{false};
 };
 
+__constant__ always_false pred{};
+__device__ bool volatile do_not_use;
+
+
+template <typename Key, typename Value, typename Op, int32_t block_size, int32_t per_warp_capacity>
+__global__
+void per_warp_shmem_insert_kernel(std::size_t num_keys_per_warp, std::size_t multiplicity){
+    using Map = typename cuco::static_reduction_map<Op, Key, Value, cuda::thread_scope_block>::device_mutable_view<per_warp_capacity>;
+
+    auto constexpr num_warps = block_size / 32;
+
+    auto warp = cg::tiled_partition<32>(cg::this_thread_block());
+
+    auto const warp_id = threadIdx.x / 32;
+
+    #pragma diag_suppress static_var_with_dynamic_init
+    __shared__ typename Map::slot_type per_warp_slots[num_warps][per_warp_capacity];
+
+    auto map = Map::make_from_uninitialized_slots(warp, per_warp_slots[warp_id], -1);
+
+    auto tid = warp.thread_rank();
+
+    bool result;
+    while(tid < num_keys_per_warp){
+        for(int i = 0; i < multiplicity; ++i){
+            result = map.insert(cuco::pair<Key,Value>{tid, i});
+        }
+        tid += warp.size();
+    }
+
+    if(pred){
+        do_not_use = result;
+    }
+}
+
+int get_max_shmem_bytes(){
+    int device;
+    cudaGetDevice(&device);
+    int shmem_bytes;
+    cudaDeviceGetAttribute(&shmem_bytes, cudaDevAttrMaxSharedMemoryPerBlock, device);
+    return shmem_bytes;
+}
+
+template <typename Key, typename Value, op_type Op, nvbench::int32_t per_warp_capacity>
+void per_warp_shmem(nvbench::state& state, 
+                    nvbench::type_list<Key, Value, nvbench::enum_type<Op>, nvbench::enum_type<per_warp_capacity>>)
+{
+   using OpType = typename op_type_map<Op>::type<Value>;
+
+   using Map = typename cuco::static_reduction_map<OpType, Key, Value, cuda::thread_scope_block>::device_mutable_view<per_warp_capacity>;
+
+   auto const occupancy = state.get_float64("Occupancy");
+   auto const num_keys_per_warp = static_cast<std::size_t>(std::floor(per_warp_capacity * occupancy));
+   auto const multiplicity = state.get_int64("Multiplicity");
+   auto constexpr block_size = 512;
+   auto constexpr num_warps = block_size / 32;
+   auto const required_shmem_bytes = num_warps * per_warp_capacity * sizeof(typename Map::slot_type);
+
+   if(required_shmem_bytes > get_max_shmem_bytes()){
+       throw;
+   }
+
+   state.exec([&](nvbench::launch& launch){
+         per_warp_shmem_insert_kernel<Key, Value, OpType, block_size, per_warp_capacity><<<512, block_size, 0, launch.get_stream()>>>(num_keys_per_warp, multiplicity);
+   });
+}
+
+// type parameter dimensions for benchmark
+using key_type_range   = nvbench::type_list<nvbench::int32_t>;
+using value_type_range = nvbench::type_list<nvbench::float64_t>;
+using op_type_range    = nvbench::enum_type_list<op_type::REDUCE_ADD>;
+using capacity_range   = nvbench::enum_type_list<128>;
+using extent_options   = nvbench::enum_type_list<Extent::DYNAMIC, Extent::STATIC>;
+
+NVBENCH_BENCH_TYPES(per_warp_shmem, 
+                    NVBENCH_TYPE_AXES(key_type_range, value_type_range, op_type_range, capacity_range))
+                    .set_name("Per-warp map insert")
+                    .set_type_axes_names({"Key", "Value", "ReductionOp", "Capacity"})
+                    .add_int64_axis("Multiplicity", {1}) 
+                    .add_float64_axis("Occupancy", nvbench::range(0.5, 0.5, 0.1));
+
+                    /*
+
 template <typename Key, typename Value, typename Op>
 __global__
 void dynamic_shmem_insert_kernel(std::size_t num_keys, std::size_t multiplicity, std::size_t capacity, always_false pred, bool* do_not_use){
